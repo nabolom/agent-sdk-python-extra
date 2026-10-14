@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-sdk-python-extra"
+version = "0.1.0"
+description = "Laboratorio opcional de Claude Agent SDK para Productividad con Claude AVANZADO"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+agent = ["claude-agent-sdk==0.2.167"]
+test = ["pytest>=8,<9"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
