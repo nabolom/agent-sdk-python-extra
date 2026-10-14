@@ -5,9 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-sdk-python-extra"
 version = "0.1.0"
-description = "Laboratorio opcional de Claude Agent SDK para Productividad con Claude AVANZADO"
+description = "Módulo extra autogestivo de Claude Agent SDK para Productividad con Claude Avanzado"
 readme = "README.md"
 requires-python = ">=3.10"
+keywords = ["python", "claude-code", "claude-agent-sdk", "anthropic-api", "mcp", "evals", "synthetic-data", "education"]
 
 [project.optional-dependencies]
 agent = ["claude-agent-sdk==0.2.167"]

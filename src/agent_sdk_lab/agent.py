@@ -1,4 +1,9 @@
-"""CLI didáctica. Por defecto no llama al modelo; --live hace una consulta nueva."""
+"""Agente didáctico del laboratorio.
+
+Sigue el recorrido en este orden: CLI -> opciones seguras -> herramienta MCP
+local -> query del SDK -> validación JSON -> resultado para la persona.
+El modo por defecto es offline y no importa ni consulta el SDK.
+"""
 
 from __future__ import annotations
 
@@ -12,9 +17,13 @@ from typing import Any
 from .cases import DATA_PATH, CaseNotFound, get_case
 from .schema import OUTPUT_SCHEMA, validate_response
 
+# El nombre completo del tool se forma con el prefijo MCP y el nombre de server.
 TOOL_NAME = "mcp__lab__consultar_caso"
 MAX_TURNS = 3
 MAX_BUDGET_USD = 0.25
+
+# El prompt explica la tarea y las abstenciones. Es orientación al modelo,
+# no una barrera de permisos: los límites técnicos están en ClaudeAgentOptions.
 SYSTEM_PROMPT = """Eres un agente didáctico de triage.
 
 Solo puedes consultar un registro sintético por medio de la herramienta local
@@ -30,7 +39,11 @@ la salida estructurada solicitada y conserva el idioma español.
 
 
 def _build_sdk_options() -> tuple[Any, Any, Any, Any]:
-    """Construye el servidor MCP y opciones SDK de forma diferida y verificable."""
+    """Define herramienta y configuración SDK; no hace una llamada al modelo.
+
+    La importación es diferida para que tests, evals y el modo offline puedan
+    ejecutarse sin instalar el extra `[agent]`.
+    """
     try:
         from claude_agent_sdk import (
             ClaudeAgentOptions,
@@ -45,6 +58,8 @@ def _build_sdk_options() -> tuple[Any, Any, Any, Any]:
             'Falta el extra del SDK. Instala con: python -m pip install -e ".[agent]"'
         ) from exc
 
+    # Paso 1: declarar la única herramienta. El esquema restringe el input a
+    # un case_id; la ruta del archivo queda fija en cases.py y no viene del LLM.
     @tool(
         "consultar_caso",
         "Consulta por ID un único registro sintético local. Solo lectura.",
@@ -52,11 +67,17 @@ def _build_sdk_options() -> tuple[Any, Any, Any, Any]:
         annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False, idempotentHint=True),
     )
     async def consultar_caso(args: dict[str, Any]) -> dict[str, Any]:
+        # Paso 2: consultar una coincidencia exacta; nunca se aceptan rutas libres.
         case_id = args.get("case_id")
         try:
             record = get_case(case_id)
         except CaseNotFound as exc:
+            # Un ID faltante es un error de herramienta explícito, no permiso
+            # para inferir o fabricar un registro.
             return {"content": [{"type": "text", "text": str(exc)}], "isError": True}
+
+        # MCP devuelve contenido textual; se serializa un objeto JSON compactado
+        # para que el modelo reciba solo el registro que solicitó.
         return {
             "content": [
                 {
@@ -66,13 +87,19 @@ def _build_sdk_options() -> tuple[Any, Any, Any, Any]:
             ]
         }
 
+    # Paso 3: registrar la herramienta en un servidor MCP en proceso.
+    # No se inicia un servidor externo ni se conecta a sistemas reales.
     mcp_server = create_sdk_mcp_server(name="lab", version="1.0.0", tools=[consultar_caso])
+
+    # Paso 4: declarar capacidades y permisos por separado.
     options = ClaudeAgentOptions(
-        # `tools` controls Claude Code's built-in tool set, not MCP servers.
-        # Empty list disables shell, filesystem and every other built-in tool.
+        # `tools` controla las herramientas built-in de Claude Code, no MCP.
+        # La lista vacía desactiva shell, filesystem y todas las built-in.
         tools=[],
-        # This allows the single custom MCP lookup without a prompt.
+        # Autoaprueba solo la consulta MCP declarada arriba. Por sí solo,
+        # `allowed_tools` no sirve como lista de herramientas disponibles.
         allowed_tools=[TOOL_NAME],
+        # Defensa adicional: nombres peligrosos siguen denegados explícitamente.
         disallowed_tools=[
             "Bash",
             "Read",
@@ -86,22 +113,31 @@ def _build_sdk_options() -> tuple[Any, Any, Any, Any]:
             "NotebookEdit",
             "TodoWrite",
         ],
+        # Acepta únicamente el server MCP entregado en esta configuración.
         mcp_servers={"lab": mcp_server},
         strict_mcp_config=True,
+        # No hereda servidores ni settings locales de proyecto/usuario.
         setting_sources=[],
+        # Sin prompt interactivo: las herramientas no autorizadas se deniegan.
         permission_mode="dontAsk",
         system_prompt=SYSTEM_PROMPT,
+        # Límites auxiliares. El coste SDK es una estimación, no un hard cap;
+        # el límite principal debe fijarse en Claude Console.
         max_turns=MAX_TURNS,
         max_budget_usd=MAX_BUDGET_USD,
+        # El SDK valida el formato de salida; luego aplicamos validación local.
         output_format={"type": "json_schema", "schema": OUTPUT_SCHEMA},
+        # Permite elegir un modelo aprobado por la organización sin fijarlo aquí.
         model=os.environ.get("CLAUDE_MODEL") or None,
+        # Mantiene el directorio de trabajo en la carpeta local de datos.
         cwd=str(DATA_PATH.parent),
     )
     return query, options, ResultMessage, consultar_caso
 
 
 async def run_live(case_id: str) -> tuple[dict[str, Any], float | None]:
-    """Hace una única consulta live y devuelve salida más coste estimado del SDK."""
+    """Ejecuta una consulta nueva; devuelve respuesta y estimación del SDK."""
+    # Falla antes de importar/iniciar el SDK si no hay clave en esta terminal.
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise RuntimeError("Falta ANTHROPIC_API_KEY en el entorno de esta terminal.")
 
@@ -110,12 +146,16 @@ async def run_live(case_id: str) -> tuple[dict[str, Any], float | None]:
         f"Analiza el caso sintético {case_id!r}. Consulta el registro con la herramienta. "
         "Devuelve la clasificación, prioridad, resumen, fact_id usados y el siguiente paso recomendado."
     )
+
+    # Una invocación `query()` puede tener hasta MAX_TURNS; este programa no
+    # añade un bucle propio de reintentos ni reanuda conversaciones anteriores.
     async for message in query(prompt=prompt, options=options):
         if isinstance(message, result_message_type):
             if message.subtype != "success" or message.structured_output is None:
                 raise RuntimeError(
                     "El SDK no devolvió una salida estructurada exitosa; revisa el resultado y el uso en Console."
                 )
+            # Comprobamos de nuevo el contrato en el boundary de nuestra app.
             response = validate_response(message.structured_output, case_id)
             cost = message.total_cost_usd
             return response, cost if isinstance(cost, (int, float)) else None
@@ -123,6 +163,7 @@ async def run_live(case_id: str) -> tuple[dict[str, Any], float | None]:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Describe los dos modos y los argumentos que puede cambiar el alumno."""
     parser = argparse.ArgumentParser(description="Laboratorio didáctico de Claude Agent SDK.")
     parser.add_argument("--case", default="SYN-001", help="ID sintético; por ejemplo SYN-001.")
     parser.add_argument(
@@ -134,7 +175,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Elige una ruta explícita: lectura offline por defecto o live con flag."""
     args = build_parser().parse_args(argv)
+
+    # Paso 1: la ruta predeterminada solo lee y muestra un caso local.
+    # No importa el SDK ni realiza llamadas, aunque haya una API key definida.
     if not args.live:
         try:
             record = get_case(args.case)
@@ -153,10 +198,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    # Paso 2: --live es una acción explícita; exige la variable de entorno.
+    # La key nunca se lee desde el repo ni se imprime.
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print("Falta ANTHROPIC_API_KEY; no se hizo ninguna llamada.", file=sys.stderr)
         return 2
 
+    # Paso 3: ejecutar y convertir errores de configuración/salida en un
+    # mensaje claro para el alumno, no en una traza innecesariamente opaca.
     try:
         response, cost_estimate = asyncio.run(run_live(args.case))
     except (RuntimeError, ValueError) as exc:
